@@ -1,106 +1,198 @@
-use std::collections::LinkedList;
-use std::sync::{Arc, Mutex, Condvar};
+use std::fs::File;
+use std::io::Write;
+use std::sync::{Arc, Mutex, RwLock};
+
+pub fn current_timestamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros()
+}
+
+pub fn jenkins_hash(key: &str) -> u32 {
+    let mut hash: u32 = 0;
+    for b in key.bytes() {
+        hash = hash.wrapping_add(b as u32);
+        hash = hash.wrapping_add(hash << 10);
+        hash ^= hash >> 6;
+    }
+    hash = hash.wrapping_add(hash << 3);
+    hash ^= hash >> 11;
+    hash = hash.wrapping_add(hash << 15);
+    hash
+}
 
 pub struct HashRecord {
     pub hash: u32,
     pub name: String,
     pub salary: u32,
+    pub next: Option<Box<HashRecord>>,
 }
 
-struct TableState {
-    records: Vec<HashRecord>,
-    current_priority: i32, // Track whose turn it is
+pub struct HashTable {
+    data: RwLock<Option<Box<HashRecord>>>,
+    log: Arc<Mutex<File>>,
 }
 
-pub struct ConcurrentTable {
-    state: Mutex<TableState>,
-    cv: Condvar,
-}
-
-impl ConcurrentTable {
-    pub fn new() -> Self {
-        Self {
-            state: Mutex::new(TableState {
-                records: Vec::new(),
-                current_priority: 0,
-            }),
-            cv: Condvar::new(),
+impl HashTable {
+    pub fn new(log_file: Arc<Mutex<File>>) -> Self {
+        HashTable {
+            data: RwLock::new(None),
+            log: log_file,
         }
     }
 
-    pub fn jenkins_hash(key: &str) -> u32 {
-        let mut hash: u32 = 0;
-        for b in key.as_bytes() {
-            hash = hash.wrapping_add(*b as u32);
-            hash = hash.wrapping_add(hash << 10);
-            hash ^= hash >> 6;
-        }
-        hash = hash.wrapping_add(hash << 3);
-        hash ^= hash >> 11;
-        hash = hash.wrapping_add(hash << 15);
-        hash
+    fn write_log(&self, msg: &str) {
+        let mut file = self.log.lock().unwrap();
+        writeln!(file, "{}", msg).unwrap();
     }
 
-    // Priority Coordination
-    pub fn wait_for_turn(&self, priority: i32) {
-        let mut state = self.state.lock().unwrap();
-        while state.current_priority != priority {
-            state = self.cv.wait(state).unwrap();
-        }
-    }
+    pub fn insert(&self, name: String, salary: u32, thread_id: u32) {
+        let hash = jenkins_hash(&name);
+        self.write_log(&format!("{}: THREAD {},INSERT,{},{}", current_timestamp(), thread_id, name, salary));
 
-    pub fn next_turn(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.current_priority += 1;
-        self.cv.notify_all();
-    }
+        let mut list = self.data.write().unwrap();
+        self.write_log(&format!("{}: THREAD {} WRITE LOCK ACQUIRED", current_timestamp(), thread_id));
 
-    pub fn insert(&self, name: String, salary: u32) -> Result<u32, u32> {
-        let hash = Self::jenkins_hash(&name);
-        let mut state = self.state.lock().unwrap();
-        
-        if state.records.iter().any(|r| r.hash == hash) {
-            return Err(hash);
+        let mut curr = &mut *list;
+
+        loop {
+            let should_break = match curr {
+                Some(node) if node.hash == hash => {
+                    println!("Insert failed. Entry {} is a duplicate.", hash);
+                    self.write_log(&format!("{}: THREAD {} WRITE LOCK RELEASED", current_timestamp(), thread_id));
+                    return;
+                }
+                Some(node) if node.hash < hash => false,
+                _ => true,
+            };
+
+            if should_break { break; }
+            curr = &mut curr.as_mut().unwrap().next;
         }
 
-        state.records.push(HashRecord { hash, name, salary });
-        Ok(hash)
-    }
+        let new_node = Box::new(HashRecord {
+            hash,
+            name: name.clone(),
+            salary,
+            next: curr.take(),
+        });
+        *curr = Some(new_node);
 
-    pub fn search(&self, name: &str) -> Option<(u32, u32)> {
-        let hash = Self::jenkins_hash(name);
-        let state = self.state.lock().unwrap();
-        state.records.iter()
-            .find(|r| r.name == name)
-            .map(|r| (r.hash, r.salary))
+        println!("Inserted {},{},{}", hash, name, salary);
+        self.write_log(&format!("{}: THREAD {} WRITE LOCK RELEASED", current_timestamp(), thread_id));
     }
+    // In hash_table.rs
 
-    pub fn update(&self, name: &str, new_salary: u32) -> Result<(u32, u32), u32> {
-        let hash = Self::jenkins_hash(name);
-        let mut state = self.state.lock().unwrap();
-        if let Some(record) = state.records.iter_mut().find(|r| r.name == name) {
-            let old = record.salary;
-            record.salary = new_salary;
-            return Ok((hash, old));
+    pub fn delete(&self, name: String, thread_id: u32) {
+        let hash = jenkins_hash(&name);
+        self.write_log(&format!("{}: THREAD {},DELETE,{},0", current_timestamp(), thread_id, name));
+
+        let mut list = self.data.write().unwrap();
+        self.write_log(&format!("{}: THREAD {} WRITE LOCK ACQUIRED", current_timestamp(), thread_id));
+
+        let mut curr = &mut *list;
+        let mut found = false;
+
+        loop {
+            let action = match curr {
+                Some(node) if node.hash == hash => 1, // Found
+                Some(node) if node.hash < hash => 2, // Keep looking
+                _ => 3, // Not in list (since it's sorted)
+            };
+
+            if action == 1 {
+                let node = curr.take().unwrap();
+                println!("Deleted record for {},{},{}", hash, name, node.salary);
+                *curr = node.next;
+                found = true;
+                break;
+            } else if action == 3 {
+                break;
+            }
+            curr = &mut curr.as_mut().unwrap().next;
         }
-        Err(hash)
+
+        if !found {
+            // Correct string for instructions: "Entry <hash> not deleted. Not in database."
+            println!("Entry {} not deleted. Not in database.", hash);
+        }
+        self.write_log(&format!("{}: THREAD {} WRITE LOCK RELEASED", current_timestamp(), thread_id));
     }
 
-    pub fn delete(&self, name: &str) -> Result<u32, u32> {
-        let hash = Self::jenkins_hash(name);
-        let mut state = self.state.lock().unwrap();
-        let len_before = state.records.len();
-        state.records.retain(|r| r.name != name);
-        
-        if state.records.len() < len_before { Ok(hash) } else { Err(hash) }
+    pub fn search(&self, name: String, thread_id: u32) {
+        let hash = jenkins_hash(&name);
+        self.write_log(&format!("{}: THREAD {},SEARCH,{},0", current_timestamp(), thread_id, name));
+
+        let list = self.data.read().unwrap();
+        self.write_log(&format!("{}: THREAD {} READ LOCK ACQUIRED", current_timestamp(), thread_id));
+
+        let mut curr = list.as_ref();
+        let mut found = false;
+
+        while let Some(node) = curr {
+            if node.hash == hash {
+                println!("Found: {},{},{}", hash, name, node.salary);
+                found = true;
+                break;
+            }
+            curr = node.next.as_ref();
+        }
+
+        if !found {
+            // Correct string for instructions: "Not Found: <name> not found."
+            println!("Not Found: {} not found.", name);
+        }
+        self.write_log(&format!("{}: THREAD {} READ LOCK RELEASED", current_timestamp(), thread_id));
     }
 
-    pub fn get_all_sorted(&self) -> Vec<(u32, String, u32)> {
-        let state = self.state.lock().unwrap();
-        let mut sorted = state.records.iter()
-            .map(|r| (r.hash, r.name.clone(), r.salary))
-            .collect::<Vec<_>>();
-        sorted.sort_by_key(|r| r.0);
-        sorted
+    pub fn update(&self, name: String, new_salary: u32, thread_id: u32) {
+        let hash = jenkins_hash(&name);
+        self.write_log(&format!("{}: THREAD {},UPDATE,{},{}", current_timestamp(), thread_id, name, new_salary));
+
+        let mut list = self.data.write().unwrap();
+        self.write_log(&format!("{}: THREAD {} WRITE LOCK ACQUIRED", current_timestamp(), thread_id));
+
+        let mut curr = list.as_mut();
+        let mut found = false;
+
+        while let Some(node) = curr {
+            if node.hash == hash {
+                let old_sal = node.salary;
+                node.salary = new_salary;
+                println!("Updated record {} from {},{},{} to {},{},{}", hash, hash, name, old_sal, hash, name, new_salary);
+                found = true;
+                break;
+            }
+            curr = node.next.as_mut();
+        }
+
+        if !found {
+            println!("Update failed. Entry {} not found.", hash);
+        }
+        self.write_log(&format!("{}: THREAD {} WRITE LOCK RELEASED", current_timestamp(), thread_id));
+    }
+
+    pub fn print_table(&self, thread_id: u32) {
+        self.write_log(&format!("{}: THREAD {},PRINT,0,0", current_timestamp(), thread_id));
+        let list = self.data.read().unwrap();
+        self.write_log(&format!("{}: THREAD {} READ LOCK ACQUIRED", current_timestamp(), thread_id));
+
+        println!("Current Database:");
+        let mut curr = list.as_ref();
+        while let Some(node) = curr {
+            println!("{},{},{}", node.hash, node.name, node.salary);
+            curr = node.next.as_ref();
+        }
+        self.write_log(&format!("{}: THREAD {} READ LOCK RELEASED", current_timestamp(), thread_id));
+    }
+
+    pub fn final_print(&self) {
+        let list = self.data.read().unwrap();
+        let mut curr = list.as_ref();
+        while let Some(node) = curr {
+            println!("{},{},{}", node.hash, node.name, node.salary);
+            curr = node.next.as_ref();
+        }
     }
 }

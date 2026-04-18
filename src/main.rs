@@ -1,98 +1,107 @@
-mod hash_table;
-mod logger;
-
-use hash_table::ConcurrentTable;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::sync::Arc;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
+mod hash_table;
+use hash_table::{current_timestamp, HashTable};
+
+enum Command {
+    Insert(String, u32, u32),
+    Delete(String, u32),
+    Update(String, u32, u32),
+    Search(String, u32),
+    Print(u32),
+}
 fn main() {
-    let table = Arc::new(ConcurrentTable::new());
-    let file = File::open("commands.txt").expect("Unable to open commands.txt");
+    let file = File::open("commands.txt").expect("Could not open commands.txt");
     let reader = BufReader::new(file);
-    let mut handles = Vec::new();
+    let mut commands = Vec::new();
 
-    for (index, line) in reader.lines().enumerate() {
+    for line in reader.lines() {
         let line = line.unwrap();
-        let table_ref = Arc::clone(&table);
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        
+        let parts: Vec<&str> = trimmed.split(',').collect();
 
-        let handle = thread::spawn(move || {
-            let parts: Vec<&str> = line.split(',').collect();
-            let cmd = parts[0];
+        match parts.as_slice() {
+            ["threads", ..] => continue,
             
-            // Assume the last part is always priority, except for update which has salary then priority? 
-            // Let's parse based on command types.
-            let priority: i32 = parts.last().unwrap().parse().unwrap_or(0);
-
-            logger::log(&format!("THREAD {} WAITING FOR MY TURN", priority));
-            table_ref.wait_for_turn(priority);
-            logger::log(&format!("THREAD {} AWAKENED FOR WORK", priority));
-            logger::log(&format!("THREAD {}, {}", priority, line));
-
-            match cmd {
-                "insert" => {
-                    let name = parts[1].to_string();
-                    let salary: u32 = parts[2].parse().unwrap();
-                    logger::log(&format!("THREAD {} WRITE LOCK ACQUIRED", priority));
-                    match table_ref.insert(name.clone(), salary) {
-                        Ok(_) => println!("INSERT*Inserted {},{}", name, salary),
-                        Err(h) => println!("INSERT*Insert failed. Entry {} is a duplicate.", h),
-                    }
-                    logger::log(&format!("THREAD {} WRITE LOCK RELEASED", priority));
-                }
-                "update" => {
-                    let name = parts[1];
-                    let salary: u32 = parts[2].parse().unwrap();
-                    logger::log(&format!("THREAD {} WRITE LOCK ACQUIRED", priority));
-                    match table_ref.update(name, salary) {
-                        Ok((h, old)) => println!("UPDATE*Updated record {} from {} to {}", h, old, salary),
-                        Err(h) => println!("UPDATE*Update failed. Entry {} not found.", h),
-                    }
-                    logger::log(&format!("THREAD {} WRITE LOCK RELEASED", priority));
-                }
-                "delete" => {
-                    let name = parts[1];
-                    logger::log(&format!("THREAD {} WRITE LOCK ACQUIRED", priority));
-                    match table_ref.delete(name) {
-                        Ok(_) => println!("DELETE*Deleted record for {}", name),
-                        Err(h) => println!("DELETE*Entry {} not deleted. Not in database.", h),
-                    }
-                    logger::log(&format!("THREAD {} WRITE LOCK RELEASED", priority));
-                }
-                "search" => {
-                    let name = parts[1];
-                    logger::log(&format!("THREAD {} READ LOCK ACQUIRED", priority));
-                    match table_ref.search(name) {
-                        Some((_, s)) => println!("SEARCH*Found: {},{}", name, s),
-                        None => println!("SEARCH*Not Found: {} not found.", name),
-                    }
-                    logger::log(&format!("THREAD {} READ LOCK RELEASED", priority));
-                }
-                "print" => {
-                    print_table(&table_ref);
-                }
-                _ => {}
+            // Format: insert,name,salary,priority
+            ["insert", name, salary, priority] => {
+                let s: u32 = salary.parse().unwrap();
+                let p: u32 = priority.parse().unwrap();
+                commands.push(Command::Insert(name.to_string(), s, p));
             }
 
-            table_ref.next_turn();
+            // Format: delete,name,placeholder,priority
+            ["delete", name, _, priority] => {
+                let p: u32 = priority.parse().unwrap();
+                commands.push(Command::Delete(name.to_string(), p));
+            }
+
+            // Format: update,name,salary,priority
+            ["update", name, salary, priority] => {
+                let s: u32 = salary.parse().unwrap();
+                let p: u32 = priority.parse().unwrap();
+                commands.push(Command::Update(name.to_string(), s, p));
+            }
+
+            // Format: search,name,placeholder,priority
+            ["search", name, _, priority] => {
+                let p: u32 = priority.parse().unwrap();
+                commands.push(Command::Search(name.to_string(), p));
+            }
+
+            // Format: print,placeholder,placeholder,priority
+            ["print", _, _, priority] => {
+                let p: u32 = priority.parse().unwrap();
+                commands.push(Command::Print(p));
+            }
+
+            _ => println!("Skipping unrecognized line structure: {}", trimmed),
+        }
+    }
+
+    let log_file = Arc::new(Mutex::new(
+        OpenOptions::new().create(true).write(true).truncate(true).open("hash.log").unwrap()
+    ));
+
+    let hash_table = Arc::new(HashTable::new(Arc::clone(&log_file)));
+    let mut handles = Vec::new();
+
+    for cmd in commands {
+        let ht = Arc::clone(&hash_table);
+        let log = Arc::clone(&log_file);
+
+        let handle = thread::spawn(move || {
+            let thread_id = match &cmd {
+                Command::Insert(_, _, id) | Command::Update(_, _, id) => *id,
+                Command::Delete(_, id) | Command::Search(_, id) | Command::Print(id) => *id,
+            };
+
+            // Requirement: Log status before work begins
+            {
+                let mut file = log.lock().unwrap();
+                writeln!(file, "{}: THREAD {} WAITING FOR MY TURN", current_timestamp(), thread_id).unwrap();
+                writeln!(file, "{}: THREAD {} AWAKENED FOR WORK", current_timestamp(), thread_id).unwrap();
+            }
+
+            match cmd {
+                Command::Insert(n, s, id) => ht.insert(n, s, id),
+                Command::Delete(n, id) => ht.delete(n, id),
+                Command::Update(n, s, id) => ht.update(n, s, id),
+                Command::Search(n, id) => ht.search(n, id),
+                Command::Print(id) => ht.print_table(id),
+            }
         });
         handles.push(handle);
     }
 
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    for h in handles { h.join().unwrap(); }
 
-    // Final Print
-    println!("\nFinal Printout:");
-    print_table(&table);
-}
-
-fn print_table(table: &ConcurrentTable) {
-    let records = table.get_all_sorted();
-    println!("PRINT*Current Database:");
-    for (h, n, s) in records {
-        println!("{},{},{}", h, n, s);
-    }
+    // Requirement: Final print must occur even if last command was PRINT
+    println!("Current Database:");
+    hash_table.final_print();
 }

@@ -1,14 +1,7 @@
-CC = rustc
-OUT = chash
-SRC = src/main.rs src/hash_table.rs src/logger.rs
-
-all: $(OUT)
-
-$(OUT): $(SRC)
-	$(CC) src/main.rs --out-dir . -o $(OUT)
+all:
+	cargo build --release
+	cp target/release/chash ./chash
 
 clean:
-	rm -f $(OUT) hash.log
-
-run: all
-	./$(OUT)
+	cargo clean
+	rm -f chash
