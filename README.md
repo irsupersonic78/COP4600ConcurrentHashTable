@@ -1,5 +1,6 @@
 # COP4600ConcurrentHashTable
 Members
+
 Isaac Rucker, Carson Prewitt, Caleb Berent, Brandon Saavedra
 
 Resources
