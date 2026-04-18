@@ -3,12 +3,14 @@ Members
 
 Isaac Rucker, Carson Prewitt, Caleb Berent, Brandon Saavedra
 
+
 Resources
 
 Github Link: https://github.com/irsupersonic78/COP4600ConcurrentHashTable 
 
 
 AI Prompt and Conversation History Links
+
 Isaac Rucker: https://gemini.google.com/app/b2abb7ec9e48bb41 
 
 Carson Prewitt:
